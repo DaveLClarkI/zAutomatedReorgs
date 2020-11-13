@@ -1,0 +1,1538 @@
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/* REXX: ANLREORG   Proc Created 12/15/2010   By Dave Clark        */
+/*                  Last Revised 06/27/2019                        */
+/*                                                                 */
+/* This procedure analyzes the content of the specified catalog(s) */
+/* for files which are  eligible for reorganization.   Any file so */
+/* identified will have a reorg job automatically submitted to the */
+/* RDR queue  either  for  immediate  or  for later execution.   A */
+/* report is also produced (or  an email sent) as notification for */
+/* both kinds of reorgs.   (NOTE: Sunday reorgs are only submitted */
+/* on Friday and Saturday, but are included in report every day.)  */
+/*                                                                 */
+/* Dataset names,  attributes,  and  statistics  for  analysis are */
+/* extracted via IDCAMS.   SPACE  availability  is also determined */
+/* via IDCAMS.   Lastly,  there is  a  separate Z-type VSE library */
+/* member,  by the same  name  as  this proc,  which contains both */
+/* reorg JCL templates  and customization parameters,  by dataset, */
+/* for those templates.                                            */
+/*                                                                 */
+/* See the  above-described  member  for  additional instructions. */
+/* Also see the sample job stream outlined later in this source as */
+/* an execution example and for SYSIPT parameter rules.            */
+/*                                                                 */
+/* The general execution format is as follows:                     */
+/*                                                                 */
+/* // EXEC REXX=ANLREORG,PARM='...'                                */
+/* vsam catalog, dataset, and volume list                          */
+/* /* EOD */                                                       */
+/*                                                                 */
+/* PARM arguments are: <USER=>userid                               */
+/*                     <OPT=>{PRINT|EMAIL}                         */
+/*                     <DIST=><dist>                               */
+/* Notes:                                                          */
+/* 1) Must be delimited by either commas, spaces, or both.         */
+/* 2) The order is positional -- unless keyword tags specified.    */
+/* 3) You cannot omit a positional argument and position the next. */
+/*                                                                 */
+/* Where: < >      encloses optional keywords and/or parameters;   */
+/*        { }      encloses a set of mutually exclusive options;   */
+/*         |       separates mutually exclusive options;           */
+/*        USER=    is an optional keyword tag;                     */
+/*        userid   is the required, authorizing LST card user id;  */
+/*        OPT=     is an optional keyword tag;                     */
+/*        PRINT    requests the reorg report be printed; (default) */
+/*        EMAIL    requests the reorg report be emailed;           */
+/*        DIST=    is an optional keyword tag; and,                */
+/*        dist     is the group name for email distribution        */
+/*                   (use slashes to delimit up to three entries   */
+/*                    and "dist" is required for OPT=EMAIL).       */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/* No warranty is expressed or implied.    Written by Dave L Clark */
+/* Neither the author nor the company is   WinWholesale Group Svcs */
+/* responsible for any loss or damage      3110 Kettering Blvd.    */
+/* resulting from the use of this code.    Dayton, OH  45439       */
+/* Source is provided on an as-is basis.   Phone (937)294-5331     */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/* The following is example JCL for running this procedure:        */
+/*                                                                 */
+/*   * $$ LST LST=SYSLST,DISP=D,CLASS=Z,DEST=(*,DLC)               */
+/*   // JOB    ANLREORG   ANALYZE CATALOGS AND SUBMIT REORGS       */
+/*   // LIBDEF *,SEARCH=DAP.PROD,TEMP                              */
+/*   // EXEC   REXX=ANLREORG,PARM='DLC,OPT=PRINT'                  */
+/*   *THIS IS A COMMENT                                            */
+/*   -DAPSCO.DAPA.CATALOG                                          */
+/*   -DAPSCO.DAPB.CATALOG                                          */
+/*   -DAPSCO.DAPC.CATALOG                                          */
+/*    ACCTREC.GL.DETAIL                              IMMED         */
+/*   -DAPSCO.DAPD.CATALOG                                          */
+/*   VIDD180                                         EXCLUDE       */
+/*   VIDD181                                         EXCLUDE       */
+/*   VIDD182                                         EXCLUDE       */
+/*   VIDD183                                         EXCLUDE       */
+/*   -DAPSCO.DAPE.CATALOG                                          */
+/*   -DAPSCO.DEVL.CATALOG                                          */
+/*    CICSPROD.TD.DATASET                            EXCLUDE       */
+/*    CICSPROD.TS.DATASET                            EXCLUDE       */
+/*    TRACK.DOCUMENT.FILE                            EXCLUDE       */
+/*   -DAPSCO.LIBR.CATALOG                                          */
+/*   /* EOD */                                                     */
+/*   /& EOJ &/                                                     */
+/*                                                                 */
+/* Rules for the SYSIPT cards:                                     */
+/*   1. Comment lines start with an asterisk.                      */
+/*   2. Prefix catalog dataset names with a dash in column 1.      */
+/*      Any catalog not listed is not examined.                    */
+/*   3. Other datasets should not be listed at all -- unless for   */
+/*      a particular dataset you wish (a) to exclude it from all   */
+/*      analysis, (b) to force the reorg job to submit, or (c) to  */
+/*      override the threshold_immed_file percentage with the      */
+/*      threshold_later_file value so it reorgs sooner than later. */
+/*      If so, specify an option of EXCLUDE, SUBMIT, or IMMED.     */
+/*   4. Volume serial numbers (prefixed by 'V') may be listed in   */
+/*      order to exclude them from "volume too full" analysis --   */
+/*      for example, where a single XXL dataset owns the volume.   */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/INCLUDE COPYBOOKS.XINITIAL
+
+  _debug = _True;            /* only interferes with OPT=PRINT */
+
+  threshold_immed_file   = 95;         /* percentage */
+  threshold_immed_volume = 95;         /* percentage */
+  threshold_later_file   = 90;         /* percentage */
+  threshold_later_volume = 90;         /* percentage */
+  threshold_later_delete = 50;         /* percentage */
+  threshold_later_splits = 50;         /* percentage */
+
+  threshold_extents.emax = 100;        /* count */
+  threshold_extents.xlds = 60;         /* count */
+  threshold_extents.ksds = 50;         /* count */
+  threshold_extents.aix  = 40;         /* count */
+  threshold_extents.esds = 30;         /* count */
+  threshold_extents.ruse = 14;         /* count */
+
+  threshold_limit_daysold  = 25;       /* count */
+  threshold_limit_deletes  = 100;      /* count; zero disables this  */
+  threshold_limit_casplits = 100;      /* count; zero disables this  */
+  threshold_limit_cisplits = 1000;     /* count; zero disables this  */
+
+  Fri_LaterReorgs = (Date('W') == "Friday");     /* boolean */
+  Sat_LaterReorgs = (Date('W') == "Saturday");   /* boolean */
+
+/* ----------------------------------------------------------------- */
+/* Get PARM arguments                                                */
+/* ----------------------------------------------------------------- */
+
+  rc = 0;
+  Arg _msg;
+
+/* ----------------------------------------------------------------- */
+/* Get SYSIPT data                                                   */
+/* ----------------------------------------------------------------- */
+
+  EXECIO "* DISKR SYSIPT ( OPEN FINIS STEM card. )";
+  If rc <> 0 Then Do
+    Say _pgm': EXECIO error, rc =' rc;
+    Exit 16;
+  End
+
+/* ----------------------------------------------------------------- */
+/* Validate PARM arguments                                           */
+/* ----------------------------------------------------------------- */
+
+  If _msg <> '' & _msg <> '?' Then Do
+    Parse Value Space(Translate(_msg,' ',',')) With ,
+      uid opt dst ext 1 'USER=' uid2 . ,
+                      1 'OPT='  opt2 . ,
+                      1 'DIST=' dst2 .;
+    If uid2 <> '' Then uid = uid2;     /* if keyword used,... */
+    If opt2 <> '' Then opt = opt2;     /* if keyword used,... */
+    If dst2 <> '' Then dst = dst2;     /* if keyword used,... */
+    If Kword(uid) Then uid = '';       /* positional omitted? */
+    If Kword(opt) Then opt = '';       /* positional omitted? */
+    If Kword(dst) Then dst = '';       /* positional omitted? */
+    If opt  == '' Then opt = 'PRINT';  /* use default setting */
+    If uid  == '',                     /* userid is required! */
+    | (opt  <> 'EMAIL' & opt <> 'PRINT'), /* invalid value    */
+    | (opt  == 'EMAIL' & dst == ''),   /* optionally required */
+    |  ext  <> '',                     /* must not be present */
+    Then Do
+      If ext <> '' Then
+        Say ' USER='uid',OPT='opt',DIST='dst',EXTRA="'ext'"';
+      Else Do
+        Say ' USER='uid',OPT='opt',DIST='dst;
+      End
+      Say ' Argument(s) missing, invalid, or extraneous data.';
+      _msg = '';
+      rc  = 12;
+    End
+  End
+
+  If _msg == '' | _msg == '?' Then Do
+    Do n = 1 While Left(Sourceline(n),2) == '/*'
+      Say Sourceline(n);
+    End
+    Exit rc;
+  End
+
+  Drop uid2 opt2 dst2 ext;
+
+/* ----------------------------------------------------------------- */
+/* Validate SYSIPT data                                              */
+/* ----------------------------------------------------------------- */
+
+  c     = 0;
+  cat.  = '';
+  cat.0 = c;
+  vlst  = '';                /* exclude volume from full analysis */
+  xlst  = '';                /* exclude dataset from all analysis */
+  immed = '';                /* reorg "immed" rather than "later" */
+  submt = '';                /* force submit of reorg job */
+
+  Do d = 1 to card.0
+    Parse Var card.d pfx 2 dsn opt2 .;
+    If pfx == '*' Then Iterate;
+    If pfx == '-' Then Do    /* check catalogs */
+      If dsn == '' Then Do
+        Say _pgm': No catalog dataset name on card' d;
+        Exit 10;
+      End
+      request.0 = 2;
+      request.1 = ' LISTCAT ENTRIES('dsn') - ';
+      request.2 = '         CATALOG(VSAM.MASTER.CATALOG) ';
+      If \IDCAMS_Results() Then Do
+        Say _pgm': Invalid catalog dataset name =' dsn;
+        Exit 10;
+      End
+      cat   = dsn;
+      c     = c + 1;
+      cat.c = cat;
+      Call Debug _pgm': Checking catalog =' cat;
+    End
+    Else Do                  /* check datasets */
+      If \InStr(pfx,' *V') Then Do
+        Say _pgm': Undefined prefix found on card' d;
+        Exit 10;
+      End
+      If dsn == '' Then Do
+        Say _pgm': No dataset/volume name on card' d;
+        Exit 10;
+      End
+      If pfx == 'V' & Length(dsn) > 6 Then Do
+        Say _pgm': Volume id too long on card' d;
+        Exit 10;
+      End
+      If c == 0 Then Do
+        Say _pgm': No catalog for dataset/volume =' dsn;
+        Exit 10;
+      End
+      Select
+        When pfx == 'V' Then vlst  = vlst dsn;
+        Otherwise
+          Select
+            When opt2 == 'IMMED'  Then immed = immed dsn;
+            When opt2 == 'SUBMIT' Then submt = submt dsn;
+            Otherwise                xlst  = xlst dsn;
+          End
+      End
+      Call Debug _pgm': Accepted dataset/volume =' dsn;
+    End
+  End
+
+  cat.0 = c;
+  Drop card. pfx dsn opt2 cat request. results.;
+
+  If cat.0 == 0 Then Do
+    Say _pgm': No catalogs specified.';
+    Exit 4;
+  End
+
+/* ----------------------------------------------------------------- */
+/* Validate and massage threshold parameters                         */
+/* ----------------------------------------------------------------- */
+
+  If DataType(threshold_immed_file,'W') Then
+    threshold_immed_file = threshold_immed_file + 0;
+  Else Do
+    Say _pgm': "threshold_immed_file" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_immed_volume,'W') Then
+    threshold_immed_volume = threshold_immed_volume + 0;
+  Else Do
+    Say _pgm': "threshold_immed_volume" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_later_file,'W') Then
+    threshold_later_file = threshold_later_file + 0;
+  Else Do
+    Say _pgm': "threshold_later_file" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_later_volume,'W') Then
+    threshold_later_volume = threshold_later_volume + 0;
+  Else Do
+    Say _pgm': "threshold_later_volume" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_later_delete,'W') Then
+    threshold_later_delete = threshold_later_delete + 0;
+  Else Do
+    Say _pgm': "threshold_later_delete" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_later_splits,'W') Then
+    threshold_later_splits = threshold_later_splits + 0;
+  Else Do
+    Say _pgm': "threshold_later_splits" threshold not a whole number.';
+    rc = 12;
+  End
+
+  If DataType(threshold_extents.emax,'W') Then
+    threshold_extents.emax = threshold_extents.emax + 0;
+  Else Do
+    Say _pgm': "threshold_extents.emax" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_extents.xlds,'W') Then
+    threshold_extents.xlds = threshold_extents.xlds + 0;
+  Else Do
+    Say _pgm': "threshold_extents.xlds" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_extents.ksds,'W') Then
+    threshold_extents.ksds = threshold_extents.ksds + 0;
+  Else Do
+    Say _pgm': "threshold_extents.ksds" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_extents.aix,'W') Then
+    threshold_extents.aix  = threshold_extents.aix  + 0;
+  Else Do
+    Say _pgm': "threshold_extents.aix" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_extents.esds,'W') Then
+    threshold_extents.esds = threshold_extents.esds + 0;
+  Else Do
+    Say _pgm': "threshold_extents.esds" threshold not a whole number.';
+    rc = 12;
+  End
+
+  If DataType(threshold_limit_daysold,'W') Then
+    threshold_limit_daysold  = threshold_limit_daysold  + 0;
+  Else Do
+    Say _pgm': "threshold_limit_daysold" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_limit_deletes,'W') Then
+    threshold_limit_deletes  = threshold_limit_deletes  + 0;
+  Else Do
+    Say _pgm': "threshold_limit_deletes" threshold not a whole number.';
+    rc = 12;
+  End
+  If DataType(threshold_limit_casplits,'W') Then
+    threshold_limit_casplits = threshold_limit_casplits + 0;
+  Else Do
+    Say _pgm': "threshold_limit_casplits" threshold not a whole number.'
+    rc = 12;
+  End
+  If DataType(threshold_limit_cisplits,'W') Then
+    threshold_limit_cisplits = threshold_limit_cisplits + 0;
+  Else Do
+    Say _pgm': "threshold_limit_cisplits" threshold not a whole number.'
+    rc = 12;
+  End
+
+  If \InList(Fri_LaterReorgs,'0 1'),
+  |  \InList(Sat_LaterReorgs,'0 1') Then Do
+    Say _pgm': "SubmitLaterReorgs" threshold not a boolean value.';
+    rc = 12;
+  End
+
+  If rc <> 0 Then Exit rc;
+
+/* ----------------------------------------------------------------- */
+/* Load reorg parameters from standard labels                        */
+/* ----------------------------------------------------------------- */
+
+  Call Debug ' ';
+
+  Call 'DITSETUP';         /* set up DITTO environment */
+  Call DittoCommand '$SET HEADERPG=NO,PRINTLEN=80,PRINTOUT=REXX';
+  If rc <> 0 Then Exit 16;
+  Call DittoCommand '$DLA SUBAREA=SYSTEM,SORTBY=NAME';
+  If rc <> 0 Then Exit 16;
+
+  dinfo.  = '';            /* dataset info */
+  dinfo.0 = 0;
+  clist.  = '';            /* cics close list */
+
+  Do z = 1 to ditto.0
+    If SubStr(ditto.z,54,3) == 'VSM' Then Do
+      Parse Var ditto.z defproc . 9 dsn 52 .;
+      dsn = ReplStr(' .',dsn,'',_True);
+      dsn = Strip(dsn,'Trailing','.');
+      If \InStr('%',dsn),
+      &  \InStr(' ',dsn),
+      Then Do
+        n = dinfo.0 + 1;
+        dinfo.n = dsn defproc;
+        dinfo.0 = n;
+        clist.defproc = defproc;
+        Call Debug _pgm': Loaded reorg parms for =' Left(defproc,8),
+                                                    dsn;
+      End
+    End
+  End
+
+  Drop ditto.;
+
+/* ----------------------------------------------------------------- */
+/* Update reorg parameters and load JCL templates from data table    */
+/* ----------------------------------------------------------------- */
+
+  Call Debug ' ';
+
+  "EXECIO * DISKR DAP.PROD."_pgm".Z ( OPEN FINIS STEM parms. )";
+  If rc <> 0 Then Do
+    z = SYSVAR('SYSLIBRCODE'); SYSLIBRCODE = Strip(SYSLIBRCODE);
+    Say _pgm': EXECIO DISKR rc =' rc '('SYSLIBRCODE')';
+    Say _pgm': Library/member = DAP.PROD.'_pgm'.Z';
+    Exit 16;
+  End
+
+  rjcl.  = '';             /* reorg jcl */
+  rjcl.0 = 0;
+  xjcl.  = '';             /* reorg XLDS */
+  xjcl.0 = 0;
+
+  Do q = 1 to parms.0
+    If Left(parms.q,1) == '*' Then Iterate;
+    If InList(Left(parms.q,3),'JCL JCX') Then Do
+      Parse Var parms.q key . 5 jclline;
+      If jclline <> '' Then Do
+        If key == 'JCL' Then Do
+          n = rjcl.0 + 1;
+          rjcl.n = Strip(jclline,'Trailing');
+          rjcl.0 = n;
+        End
+        Else Do
+          n = xjcl.0 + 1;
+          xjcl.n = Strip(jclline,'Trailing');
+          xjcl.0 = n;
+        End
+      End
+      Iterate;
+    End
+    Parse Var parms.q defproc seq . 14 dsn aixproc .;
+    If defproc == '' | seq == 2 | dsn == '' Then Do
+      Say _pgm': Parm cards improperly formatted near "'defproc'"';
+      Say _pgm': Library/member = DAP.PROD.'_pgm'.Z';
+      Exit 16;
+    End
+    If seq <> 1 Then
+      clst = defproc;
+    Else Do
+      q = q + 1;
+      Parse Var parms.q proc2 seq2 . 14 clst;
+      If defproc <> proc2 | seq2 <> 2 | clst == '' Then Do
+        Say _pgm': Parm cards improperly formatted near "'defproc'"';
+        Say _pgm': Library/member = DAP.PROD.'_pgm'.Z';
+        Exit 16;
+      End
+    End
+    n = LocateReorgParms(dsn,'Silent');
+    If n <> 0 Then Do
+      dinfo.n = dsn defproc aixproc;
+      clist.defproc = clst;
+      Call Debug _pgm': Updatd reorg parms for =' Left(defproc,8),
+                                                  dsn;
+    End
+    Else Do
+      n = dinfo.0 + 1;
+      dinfo.n = dsn defproc aixproc;
+      dinfo.0 = n;
+      clist.defproc = clst;
+      Call Debug _pgm': Adding reorg parms for =' Left(defproc,8),
+                                                  dsn;
+      z = SORTSTEM('DINFO.','ZONE 1 44');
+    End
+  End
+
+  Drop parms. jclline dsn defproc aixproc clst seq seq2 proc2;
+
+/* ----------------------------------------------------------------- */
+/* Set up for PRINT or EMAIL output                                  */
+/* ----------------------------------------------------------------- */
+
+  y = REXXIPT('OFF');                  /* not using REXX input */
+  z = SYSVAR(SYSPOWJNM);
+  SYSPOWJNM  = Strip(SYSPOWJNM);
+
+  'SETUID' uid;
+
+  If opt == 'EMAIL' Then Do
+
+    title   = '('SYSPOWJNM') Reorg Analysis Report';
+    Parse Value Space(Translate(dst,' ','/')) With usr1 usr2 usr3 .;
+
+    mailwrtr = '00000001'x;   /* request one-time initialization */
+    Address LINKPGM "IGZERRE mailwrtr";      /* of COBOL storage */
+    If rc <> 0 Then Do
+      Say _pgm': Error from IGZERRE, rc =' rc;
+      Exit 10;
+    End
+
+    mailwrtr = 'H',                              /* head parms   */
+            || '0000000000000000'x,              /* mail id      */
+            || '00000C'x,                        /* body seq     */
+            || Left(usr1,25,' '),                /* dist group 1 */
+            || Copies(' ',64),                   /* mail from    */
+            || Left(title,64,' '),               /* mail subject */
+            || Left('Y SY',8,' ');               /* mail options */
+    Address LINKPGM "MAILWRTB mailwrtr";
+    If rc <> 0 Then Exit 10;
+
+    If usr2 > ' ' Then Do
+      mailwrtr = 'D',                            /* dist parms   */
+              || SubStr(mailwrtr,2,11),          /* inflight     */
+              || Left(usr2,25,' ');              /* dist group 2 */
+      Address LINKPGM "MAILWRTB mailwrtr";
+      If rc <> 0 Then Exit 10;
+    End
+
+    If usr3 > ' ' Then Do
+      mailwrtr = 'D',                            /* dist parms   */
+              || SubStr(mailwrtr,2,11),          /* inflight     */
+              || Left(usr3,25,' ');              /* dist group 3 */
+      Address LINKPGM "MAILWRTB mailwrtr";
+      If rc <> 0 Then Exit 10;
+    End
+
+  End
+
+  hctl    = '';
+  hdr     = _True;
+  col     = _True;
+  colhdr  = 'LastDefine Fsize Records Ext FreeSpc DelSpc Splits Reorg',
+            Translate(Center('Reason',16),'_',' ');
+  periods = Copies(' .',22);
+  rpt.    = '';
+  rpt.0   = 0;
+
+  _based  = Date('B');                 /* for elapsed days calcs */
+
+  /* indexes for attribtues and statistics array */
+  _dst = 1; _dta = 2; _idx    = 3; _pth    = 4;
+  name = 1; type = 2; created = 3; expires = 4; owner = 5; release = 6;
+  bassoc     = 7;  passoc    = 8;  xassoc      = 9;  bufspace    = 10;
+  keylen     = 11; relkeypos = 12; aixrelkey   = 13; avglrecl    = 14;
+  maxlrecl   = 15; cisize    = 16; ciperca     = 17; excpexit    = 18;
+  samlrecl   = 19; recformat = 20; records     = 21; deletes     = 22;
+  inserts    = 23; updates   = 24; retrieves   = 25; excps       = 26;
+  cisplits   = 27; casplits  = 28; cifreespace = 29; cafreespace = 30;
+  freespace  = 31; extents   = 32; stampdate   = 33; stamptime   = 34;
+  xlevels    = 35; xentries  = 36; xseqsetrba  = 37; xhilvlrba   = 38;
+  allocunits = 40; primary   = 41; secondary   = 42; puseclass   = 43;
+  suseclass  = 44; hialcrba  = 45; hiuserba    = 46; volumes     = 48;
+  shroptns   = 50; recovery  = 51; alloctype   = 52; erase       = 53;
+  compress   = 54; indexed   = 55; writechk    = 56; imbed       = 57;
+  replicate  = 58; ordered   = 59; reuse       = 60; spanned     = 61;
+  uniquekey  = 62; update    = 63; upgrade     = 64;
+
+/* ----------------------------------------------------------------- */
+/* Got all the data ... start processing ...                         */
+/* ----------------------------------------------------------------- */
+
+  Call Debug ' ';
+  Call Debug _pgm': Processing beginning...';
+
+/* ----------------------------------------------------------------- */
+/* Process Catalog list                                              */
+/* ----------------------------------------------------------------- */
+
+  Do c = 1 to cat.0 While rc == 0
+
+    cat = cat.c;
+    Call BrowseCatalog;                /* REXXIPT used here */
+
+  End
+
+  Drop cat. cat;
+
+/* ----------------------------------------------------------------- */
+/* Optionally PRINT or submit EMAIL job                              */
+/* ----------------------------------------------------------------- */
+
+  Call Debug ' ';
+
+  If rc == 0 Then Do
+    y = REXXIPT('OFF');                /* so turn it off here */
+
+    If opt == 'EMAIL' Then Do
+
+      If rpt.0 == 0 Then Do
+        Call AddLine '(analysis yielded no reorg requirements)';
+      End
+      mailwrtr = 'B',                            /* body parms */
+              || SubStr(mailwrtr,2,11),          /* inflight   */
+              || Left('<pre><br>',240,' ');      /* body text  */
+      Address LINKPGM "MAILWRTB mailwrtr";
+      Do n = 1 to rpt.0 While rc == 0
+        mailwrtr = 'B',                          /* body parms */
+                || SubStr(mailwrtr,2,11),        /* inflight   */
+                || Left(rpt.n'<br>',240,' ');    /* body text  */
+        Address LINKPGM "MAILWRTB mailwrtr";
+      End n
+      If rc == 0 Then Do
+        mailwrtr = 'B',                          /* body parms */
+                || SubStr(mailwrtr,2,11),        /* inflight   */
+                || Left('</pre>',240,' ');       /* body text  */
+        Address LINKPGM "MAILWRTB mailwrtr";
+      End
+      If rc <> 0 Then Do
+        Say _pgm': Error from LINKPGM, rc =' rc;
+        Say ' ';
+        rc = 14;
+      End
+
+    End
+    Else Do
+
+      If rpt.0 == 0 Then Do
+        Call AddLine ' (analysis yielded no reorg requirements)';
+      End
+      "EXECIO * DISKW SYSLST ( OPEN FINIS CC STEM rpt."
+      If rc <> 0 Then Do
+        Say _pgm': Error in EXECIO, rc =' rc;
+        Say ' ';
+      End
+
+    End
+  End
+
+/* ----------------------------------------------------------------- */
+/* Exit procedure                                                    */
+/* ----------------------------------------------------------------- */
+
+  If rc == 0 Then Do
+    If opt == 'EMAIL' Then Do
+      mailwrtr = 'C',                            /* complete mail */
+              || SubStr(mailwrtr,2,11);          /* inflight      */
+      Address LINKPGM "MAILWRTB mailwrtr";
+    End
+    Call Debug _pgm': Processing completed.';
+  End
+  Else Do
+    _rc = rc;
+    If opt == 'EMAIL' Then Do
+      mailwrtr = 'P',                            /* purge mail */
+              || SubStr(mailwrtr,2,11);          /* inflight   */
+      Address LINKPGM "MAILWRTB mailwrtr";
+    End
+    _str = RXDMPVAR('List'); /* list all variable names  */
+    Parse Var _str resp list;
+    If resp <> 'OK' Then Do
+      Say _pgm': RXDMPVAR error response =' str;
+      Exit 4;
+    End
+    Drop _str;
+    If Words(list) < 900 Then Do
+      list = SHAKESRT(list); /* do a Shaker-Sort of list */
+    End
+    Do n = 1 To Words(list)
+      Say ' 'Word(list,n)' = 'Value(Word(list,n));
+    End
+    rc = _rc;
+    Say _pgm': Processing terminated, rc='rc;
+  End
+
+Exit rc;
+
+/* ================================================================= */
+/* Internal subroutines and functions                                */
+/* ================================================================= */
+
+BrowseCatalog:
+  Call Debug ' ';
+  Call Debug _pgm': .... Browsing catalog =' cat;
+  hctl = cat;
+  hdr = _True;
+  rc = ExtractSpaceInfo();             /* IDCAMS SPACE listing */
+  If rc <> 0 Then Do
+    Say _pgm': SPACE browse failed, rc='rc',' cat;
+    Return;
+  End
+  rc = ExtractDatasetNames();          /* IDCAMS NAME listing  */
+  If rc <> 0 Then Do
+    Say _pgm': Catalog browse failed, rc='rc',' cat;
+    Return;
+  End
+  Do d = 1 to dnm.0 While rc == 0
+    dsn = Strip(dnm.d);
+    If dsn <> cat Then Do
+      rc = ExtractDatasetStatistics(); /* IDCAMS ENTRY listing */
+      If rc <> 0 Then Do
+        Say _pgm': Statistics extract failed, rc='rc',' cat;
+        Return;
+      End
+      dtype = stat._dst.type;
+      Select
+        When InList(dsn,xlst) Then
+          Call Debug _pgm': Ignoring' Left(dtype,4) 'dataset =' dsn;
+        When InList(dtype, 'AIX ESDS KSDS XLDS') Then
+          Call ExamineDataset;
+        Otherwise
+          Call Debug _pgm': Skipping' Left(dtype,4) 'dataset =' dsn;
+      End
+      Drop stat. dtype;
+    End
+  End d
+  Drop dnm. vols.;
+Return;
+
+ExtractSpaceInfo:
+  request.0 = 1;
+  request.1 = ' LISTCAT SPACE ALL CATALOG('cat') ';
+  If \IDCAMS_Results() Then Do    /* extract space info */
+    Return 16;
+  End
+  vols.  = '';
+  vols.0 = 0;
+  Do i = 1 to results.0
+    Select
+      When SubStr(results.i,1,6) == 'VOLUME' Then Do
+        Parse Var results.i . . vol .;
+        n = vols.0 + 1;
+        vols.n = vol 0 0;
+        vols.0 = n;
+      End
+      When InStr('BLOCKS-TOTAL',results.i),
+      |    InStr('TRACKS-TOTAL',results.i),
+      Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With . . t1 .;
+        Parse Var vols.n vol tot use .;
+        vols.n = vol (tot + t1) use;
+      End
+      When InStr('BLOCKS-USED',results.i),
+      |    InStr('TRACKS-USED',results.i),
+      Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With . . u1 .;
+        Parse Var vols.n vol tot use .;
+        vols.n = vol tot (use + u1);
+      End
+      Otherwise
+    End
+  End i
+  Do n = 1 to vols.0
+    Parse Var vols.n vol tot use .;
+    vols.n = Left(vol,6,' ') ((use / tot) * 100) (tot - use);
+  End n
+  Drop request. results. vol tot use;
+  z = SORTSTEM('VOLS.','ZONE 1 6');
+Return 0;
+
+ExtractDatasetNames:
+  request.0 = 1;
+  request.1 = ' LISTCAT AIX CLUSTER NAME CATALOG('cat') ';
+  If \IDCAMS_Results() Then Do    /* extract dataset names */
+    Return 16;
+  End
+  dnm.  = '';
+  dnm.0 = 0;
+  Do i = 1 to results.0
+    Select
+      When SubStr(results.i,1,3) == 'AIX' Then Do
+        Parse Var results.i . . dnm .;
+        n = dnm.0 + 1;
+        dnm.n = Left(dnm,44,' ');
+        dnm.0 = n;
+      End
+      When SubStr(results.i,1,7) == 'CLUSTER' Then Do
+        Parse Var results.i . . dnm .;
+        n = dnm.0 + 1;
+        dnm.n = Left(dnm,44,' ');
+        dnm.0 = n;
+      End
+      Otherwise
+    End
+  End i
+  Drop request. results. dnm;
+  z = SORTSTEM('DNM.','ZONE 1 44');
+Return 0;
+
+ExtractDatasetStatistics:
+  request.0 = 2;
+  request.1 = ' LISTCAT ENTRIES('dsn') - ';
+  request.2 = '         ALL CATALOG('cat') ';
+  If \IDCAMS_Results() Then Do    /* extract dataset stats */
+    Return 16;
+  End
+  comp = 0;
+  stat.  = '';
+  stat.0 = 4;
+  stat._dst. = '';
+  stat._dta. = '';
+  stat._idx. = '';
+  stat._pth. = '';
+  Do i = 1 to results.0
+    Select
+      /* ------ DATASET COMPONENTS ---------------------------- */
+      When SubStr(results.i,1,3) == 'AIX' Then Do
+        Parse Var results.i . . stat.comp.name .;
+        comp = _dst;
+        stat.comp.type = 'AIX';        /* DATASET TYPE */
+      End
+      When SubStr(results.i,1,7) == 'CLUSTER' Then Do
+        Parse Var results.i . . stat.comp.name .;
+        comp = _dst;                   /* SEE BELOW FOR TYPE */
+      End
+      When SubStr(results.i,4,4) == 'DATA' Then Do
+        Parse Var results.i . . stat.comp.name .;
+        comp = _dta;
+      End
+      When SubStr(results.i,4,5) == 'INDEX' Then Do
+        Parse Var results.i . . stat.comp.name .;
+        comp = _idx;
+      End
+      When SubStr(results.i,4,4) == 'PATH' Then Do
+        Parse Var results.i . . stat.comp.name .;
+        comp = _pth;
+      End
+      /* ------ DATASET HEADERS ------------------------------- */
+      When InStr('OWNER-IDENT',results.i) Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    '(' stat.comp.owner ')' . stat.comp.created .;
+        If SubStr(stat.comp.created,5,1) == '.' Then Do
+          stat.comp.created = DelStr(stat.comp.created,5,1);
+        End
+      End
+      When InStr('EXPIRATION',results.i) Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.release . stat.comp.expires .;
+        If SubStr(stat.comp.expires,5,1) == '.' Then Do
+          stat.comp.expires = DelStr(stat.comp.expires,5,1);
+        End
+      End
+      /* ------ DATASET ASSOCIATIONS -------------------------- */
+      When SubStr(results.i,8,3) == 'AIX' Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With . dnm .;
+        If comp == _dst | comp == _pth Then
+          stat.comp.xassoc = dnm;
+        Else Do
+          stat.comp.bassoc = dnm;
+        End
+      End
+      When SubStr(results.i,8,7) == 'CLUSTER' Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.bassoc .;
+      End
+      When SubStr(results.i,8,4) == 'PATH' Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.passoc .;
+      End
+      /* ------ DATASET SPECIFICATIONS ------------------------ */
+      When InStr('AVGLRECL',results.i) Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.keylen . stat.comp.avglrecl .,
+                    stat.comp.bufspace . stat.comp.cisize .;
+      End
+      When InStr('MAXLRECL',results.i) Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.relkeypos . stat.comp.maxlrecl .,
+                    '(' stat.comp.excpexit ')' . stat.comp.ciperca .;
+      End
+      When InStr('SAMLRECL',results.i) Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.samlrecl . stat.comp.recformat .;
+      End
+      When InStr('AXRKP',results.i) Then Do
+        Parse Value Space(Translate(results.i,' ','-')) With .,
+                    stat.comp.aixrelkey .;
+      End
+      /* ------ DATASET STATISTICS ---------------------------- */
+      When InStr('REC-TOTAL',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . 17,
+                    stat.comp.records . 46 stat.comp.cisplits .,
+                    stat.comp.excps .;
+      End
+      When InStr('REC-DELETED',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . 19,
+                    stat.comp.deletes . 46 stat.comp.casplits .,
+                    stat.comp.extents . stat.comp.xlevels .;
+      End
+      When InStr('REC-INSERTED',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . 20,
+                    stat.comp.inserts . 50 stat.comp.cifreespace .,
+                    107 stat.comp.xentries .;
+      End
+      When InStr('REC-UPDATED',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . 19,
+                    stat.comp.updates . 50 stat.comp.cafreespace,
+                    stat.comp.stampdate stat.comp.stamptime .,
+                    106 stat.comp.xseqsetrba .;
+      End
+      When InStr('REC-RETRIEVED',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . 21,
+                    stat.comp.retrieves . 46 stat.comp.freespace .,
+                    107 stat.comp.xhilvlrba .;
+      End
+      /* ------ DATASET ALLOCATIONS --------------------------- */
+      When InStr('SPACE-TYPE',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . .,
+                    stat.comp.allocunits .;
+      End
+      When InStr('SPACE-PRI',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . .,
+                    stat.comp.primary . . stat.comp.puseclass .,
+                    78 stat.comp.hialcrba .;
+      End
+      When InStr('SPACE-SEC',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . .,
+                    stat.comp.secondary . . stat.comp.suseclass .,
+                    78 stat.comp.hiuserba .;
+      End
+      When InStr('VOLSER',results.i) Then Do
+        Parse Value Translate(results.i,' ','-') With . vol .;
+        stat.comp.volumes = Strip(stat.comp.volumes vol);
+      End
+      Otherwise
+    End
+    /* -------- DATASET TYPE ------------------------------------ */
+    If InStr(' NUMBERED ',results.i) Then Do
+      stat._dst.type = 'RRDS';
+      stat.comp.indexed = _False;
+    End
+    If InStr('INDEX-NUMB',results.i) Then Do
+      stat._dst.type = 'VRDS';
+      stat.comp.indexed = _True;
+    End
+    If InStr('EXP-DEFINE',results.i) Then Do
+      stat._dst.type = 'SAME';
+      stat.comp.indexed = _False;
+    End
+    If InStr('IMP-DEFINE',results.i) Then Do
+      stat._dst.type = 'SAMI';
+      stat.comp.indexed = _False;
+    End
+    If InStr('EXTRALARGE',results.i) Then Do
+      stat._dst.type = 'XLDS';
+      stat.comp.indexed = _True;
+    End
+    If InStr(' NONINDEXED ',results.i) Then Do
+      If InStr(' VSAMDATSET ',results.i) Then Do
+        stat._dst.type = 'ESDS';
+      End
+      stat.comp.indexed = _False;
+    End
+    Else Do
+      If InStr(' INDEXED ',results.i) Then Do
+        If \InList(stat._dst.type,'AIX VRDS XLDS') Then Do
+          stat._dst.type = 'KSDS';
+        End
+        stat.comp.indexed = _True;
+      End
+    End
+    /* -------- DATASET ATTRIBUTES ------------------------------ */
+    If InStr('SHROPTNS',results.i) Then Do
+      Parse Value Space(Translate(results.i,' ',',')) With .,
+                  'SHROPTNS(' stat.comp.shroptns ')' .;
+    End
+    If InStr(' RECOVERY ',results.i) Then Do
+      stat.comp.recovery = _True;
+    End
+    If InStr(' SPEED ',results.i) Then Do
+      stat.comp.recovery = _False;
+    End
+    If InStr(' SUBALLOC ',results.i) Then Do
+      stat.comp.alloctype = 'SUBALLOC';
+    End
+    If InStr(' NOALLOC ',results.i) Then Do
+      stat.comp.alloctype = 'NOALLOC';
+    End
+    If InStr(' UNIQUE ',results.i) Then Do
+      stat.comp.alloctype = 'UNIQUE';
+    End
+    If InStr(' NOERASE ',results.i) Then Do
+      stat.comp.erase = _False;
+    End
+    Else Do
+      If InStr(' ERASE ',results.i) Then Do
+        stat.comp.erase = _True;
+      End
+    End
+    If InStr(' NOCOMPRESS ',results.i) Then Do
+      stat.comp.compress = _False;
+    End
+    Else Do
+      If InStr(' COMPRESS ',results.i) Then Do
+        stat.comp.compress = _True;
+      End
+    End
+    If InStr(' NOWRITECHK ',results.i) Then Do
+      stat.comp.writechk = _False;
+    End
+    Else Do
+      If InStr(' WRITECHK ',results.i) Then Do
+        stat.comp.writechk = _True;
+      End
+    End
+    If InStr(' NOIMBED ',results.i) Then Do
+      stat.comp.imbed = _False;
+    End
+    Else Do
+      If InStr(' IMBED ',results.i) Then Do
+        stat.comp.imbed = _True;
+      End
+    End
+    If InStr(' NOREPLICAT ',results.i) Then Do
+      stat.comp.replicate = _False;
+    End
+    Else Do
+      If InStr(' REPLICATE ',results.i) Then Do
+        stat.comp.replicate = _True;
+      End
+    End
+    If InStr(' UNORDERED ',results.i) Then Do
+      stat.comp.ordered = _False;
+    End
+    Else Do
+      If InStr(' ORDERED ',results.i) Then Do
+        stat.comp.ordered = _True;
+      End
+    End
+    If InStr(' NOREUSE ',results.i) Then Do
+      stat.comp.reuse = _False;
+    End
+    Else Do
+      If InStr(' REUSE ',results.i) Then Do
+        stat.comp.reuse = _True;
+      End
+    End
+    If InStr(' NONSPANNED ',results.i) Then Do
+      stat.comp.spanned = _False;
+    End
+    Else Do
+      If InStr(' SPANNED ',results.i) Then Do
+        stat.comp.spanned = _True;
+      End
+    End
+    If InStr(' NONUNIQKEY ',results.i) Then Do
+      stat.comp.uniquekey = _False;
+    End
+    Else Do
+      If InStr(' UNIQUEKEY ',results.i) Then Do
+        stat.comp.uniquekey = _True;
+      End
+    End
+    If InStr(' NOUPDATE ',results.i) Then Do
+      stat.comp.update = _False;
+    End
+    Else Do
+      If InStr(' UPDATE ',results.i) Then Do
+        stat.comp.update = _True;
+      End
+    End
+    If InStr(' NOUPGRADE ',results.i) Then Do
+      stat.comp.upgrade = _False;
+    End
+    Else Do
+      If InStr(' UPGRADE ',results.i) Then Do
+        stat.comp.upgrade = _True;
+      End
+    End
+  End i
+  Drop request. results. comp dnm vol;
+Return 0;
+
+ExamineDataset:
+         /* Note that because REXX always tests every condition in  */
+         /* an IF statement, the following tests are in reverse     */
+         /* order of their importance so that the most important    */
+         /* reason for reorg is always listed on the report.        */
+  Select
+    When InList(dsn,submt),                  /* requested submittal */
+      Then Do
+        _reason = 'Requested reorg';
+        Call ReorgDataset 'SUBMT','REQU';
+      End
+    When TooManyExtents(threshold_extents.emax), /* max is 123 ext. */
+       | stat._dst.reuse == _True,      /* max for reuse is 16 ext. */
+                         & TooManyExtents(threshold_extents.ruse),
+       | NoRoomForExtent(),            /* based on secondary extent */
+       | VolumeTooFull(threshold_immed_volume), /* VSAMTUNE SPCMAP  */
+       | InList(dsn,immed) & FileTooFull(threshold_later_file),
+       | FileTooFull(threshold_immed_file), /* files/zero secondary */
+      Then Do
+        Call ReorgDataset 'IMMED','CRIT';
+      End
+    When VolumeTooFull(threshold_later_volume), /* VSAMTUNE SPCMAP  */
+       | FileTooFull(threshold_later_file), /* files/zero secondary */
+      Then Do
+        Call ReorgDataset 'LATER','CRIT';
+      End
+    When TooManyExtents(threshold_extents.dtype), /* by cluster type */
+       | TooManySplits(threshold_later_splits),  /* % of total CA's */
+       | TooManyDeletes(threshold_later_delete), /* % of total recs */
+      Then Do
+        Call ReorgDataset 'LATER','WAIT';
+      End
+    Otherwise
+  End
+Return;
+
+FileTooFull:
+  Arg _allowed;
+  If stat._dta.secondary > 0 Then
+    _calc = 0;
+  Else Do
+    _calc = GetFullPct();
+    If dtype == 'XLDS',
+    &  stat._dta.extents > 19,
+    Then Do
+      _allowed = 50;         /* XLDS can't fill the 20th volume */
+    End
+  End
+  If _calc > _allowed Then Do
+    Call Debug _pgm': File too full at' _calc'%, dataset =' dsn;
+    _reason = 'File Too Full';
+    Return _True;
+  End
+Return _False;
+
+IDCAMS_Results: Procedure Expose _pgm _True _False request. results.;
+  y = REXXIPT('request.');
+  y = OUTTRAP('results.','*','NOCONCAT');
+  Address LINK 'IDCAMS';
+  If rc <> 0 Then Do
+    Say ' ';
+    Say _pgm': IDCAMS failed on the following request:';
+    Do i = 1 to request.0
+      Say request.i;
+    End i
+    Say _pgm': The following were the IDCAMS results:';
+    Do i = 1 to results.0
+      Say results.i;
+    End i
+    Say ' ';
+    Return _False;
+  End
+Return _True;
+
+VolumeTooFull:
+  Arg _allowed;
+  Do v = 1 to Words(stat._dta.volumes)
+    _vol = Word(stat._dta.volumes,v);
+    If InList(_vol,vlst) Then
+      Call Debug _pgm': Ignoring volume' _vol 'for dataset =' dsn;
+    Else Do
+      _volinfo = FindVolumeInfo(_vol);
+      If Word(_volinfo,2) > _allowed Then Do
+        Call Debug _pgm': Volume' _vol 'too full at' Word(_volinfo,2),
+                                    ||'%, dataset =' dsn;
+        _reason = _vol 'Too Full';
+        Return _True;
+      End
+    End
+  End
+Return _False;
+
+NoRoomForExtent:
+  _allowed = 0;
+  Do v = 1 to Words(stat._dta.volumes)
+    If \InList(stat._dst.type, 'AIX KSDS') Then Do
+      stat._idx.secondary = 0;
+      stat._idx.allocunits = 'TRACKS';
+    End
+    _vol = Word(stat._dta.volumes,v);
+    If \InList(_vol,vlst),
+    & (stat._dta.secondary > 0 | stat._idx.secondary > 0),
+    Then Do
+      _volinfo = FindVolumeInfo(_vol);
+      Select
+        When stat._dta.allocunits == 'TRACKS',
+           & stat._dta.secondary > Word(_volinfo,3),
+           | stat._dta.allocunits <> 'TRACKS',
+           & stat._dta.secondary > Trunc(Word(_volinfo,3)/15),
+          Then Do
+            Call Debug _pgm': No room for data extent of',
+                                          stat._dta.secondary,
+                                          stat._dta.allocunits';',
+                                          _volinfo';',
+                              'dataset =' dsn;
+            _reason = 'NoRoom 4 DataExt';
+            Return _True;
+          End
+        When stat._idx.allocunits == 'TRACKS',
+           & stat._idx.secondary > Word(_volinfo,3),
+           | stat._idx.allocunits <> 'TRACKS',
+           & stat._idx.secondary > Trunc(Word(_volinfo,3)/15),
+          Then Do
+            Call Debug _pgm': No room for index extent of'
+                                          stat._idx.secondary,
+                                          stat._idx.allocunits';',
+                                          _volinfo';',
+                              'dataset =' dsn;
+            _reason = 'NoRoom 4 IndxExt';
+            Return _True;
+          End
+        Otherwise
+      End
+    End
+  End
+Return _False;
+
+TooManyDeletes:
+  Arg _allowed;
+  _calc = GetDeletePct();
+  If _calc > _allowed Then Do
+    Call Debug _pgm': Too many deletes at' _calc'%, dataset =' dsn;
+    _reason = 'Too Many Deletes';
+    Return _True;
+  End
+Return _False;
+
+TooManySplits:
+  Arg _allowed;
+  _calc = GetSplitPct();
+  If _calc > _allowed Then Do
+    Call Debug _pgm': Too many splits at' _calc'%, dataset =' dsn;
+    _reason = 'Too Many Splits';
+    Return _True;
+  End
+Return _False;
+
+TooManyExtents:
+  Arg _allowed;
+  If dtype == 'ESDS' Then Do
+    stat._idx.extents = 0;
+  End
+  If stat._dta.extents > _allowed,
+  |  stat._idx.extents > _allowed,
+  Then Do
+    If stat._dta.extents > _allowed Then Do
+      Call Debug _pgm': Too many data extents at' stat._dta.extents',',
+                                      'dataset =' dsn;
+      _reason = 'Too Many DataExt';
+    End
+    If stat._idx.extents > _allowed Then Do
+      Call Debug _pgm': Too many index extents at' stat._idx.extents',',
+                                       'dataset =' dsn;
+      _reason = 'Too Many IndxExt';
+    End
+    Return _True;
+  End
+Return _False;
+
+ReorgDataset:
+  Arg mode,reas;
+  Select
+    When mode <> 'SUBMT',
+      &  stat._dta.deletes = 0,
+      &  stat._dta.casplits = 0,
+      &  stat._dta.cisplits = 0,
+      Then Do
+        Call Debug _pgm': Nothing for' mode 'reorg in' dtype 'file,',
+                                          'dataset =' dsn;
+        mode = '';
+      End
+    When mode == 'LATER' & reas <> 'CRIT',
+      &  DaysSinceCreated() < threshold_limit_daysold,
+      & (threshold_limit_deletes  = 0 |,
+         stat._dta.deletes  < threshold_limit_deletes),
+      & (threshold_limit_casplits = 0 |,
+         stat._dta.casplits < threshold_limit_casplits),
+      & (threshold_limit_cisplits = 0 |,
+         stat._dta.cisplits < threshold_limit_cisplits),
+      Then Do
+        Call Debug _pgm': Too soon to' mode 'reorg of' dtype 'file,',
+                                            'dataset =' dsn;
+        mode = Left('<'threshold_limit_daysold'DAY',5);
+      End
+    Otherwise
+      Do
+        Call Debug _pgm': Processing' dtype 'file for' mode 'reorg,',
+                                           'dataset =' dsn;
+        If mode <> 'LATER' | Fri_LaterReorgs | Sat_LaterReorgs,
+        Then Do
+          Call SubmitReorg mode, dtype, dsn, cat;
+          If rc <> 0 Then Do
+            If rc <> 23 Then Return;
+            mode = '';
+            rc = 0;
+          End
+        End
+      End
+  End
+  Call BuildLine;
+Return;
+
+/* ----------------------------------------------------------------- */
+/* Build Email or Print lines                                        */
+/* ----------------------------------------------------------------- */
+
+AddLine:
+  n = rpt.0 + 1;
+  rpt.n = Arg(1);
+  rpt.0 = n;
+Return;
+
+BuildLine:
+  l = 40;
+  w = Length(dsn);
+  u = Date('U',Right(stat._dst.created,5),'J');
+  u = Left(u,6)||Left(stat._dst.created,4);
+
+  d1= IFF(w>(l-7), Left(dsn,l-7)||'\\', dsn Right(periods,l-5-w-1)),
+      Left(dtype,4),
+      u;
+  d2= FileSize(stat._dta.hialcrba,stat._dta.cisize,dtype),
+      FormatScaled(stat._dta.records,7,5,0,1000," KMBTQ"),
+      Right(stat._dta.extents,3),
+      Right(CalcFspcPct(),7),
+      Right(CalcDelPct(),6),
+      Right(CalcSplitPct(),6),
+      ReplStr('<',Left(mode,5),'&lt;'),
+      _reason;
+
+  If hdr Then Do
+    hdr = _False;
+    If rpt.0 > 0 Then Do
+      Call Addline IFF(opt=='EMAIL','41'x,' ');
+    End
+    Call AddLine IFF(opt=='EMAIL','',' ')||,
+                 Translate(Center(cat,l),'_',' '),
+                 IFF(col,colhdr,' ');
+    col = _False;
+  End
+
+  Call Addline IFF(opt=='EMAIL','',' ')||d1 d2;
+Return;
+
+CalcDelPct:
+  _calc = GetDeletePct();
+Return Format(_calc,,1)"%";
+
+CalcFspcPct:
+  _calc = 100 - GetFullPct();
+Return Format(_calc,,2)"%";
+
+CalcSplitPct:
+  _calc = GetSplitPct();
+Return Format(_calc,,1)"%";
+
+Debug: Procedure Expose _pgm _debug;
+  Parse Arg _msg;
+  If _debug Then Say _msg;
+Return;
+
+DaysSinceCreated:
+  _calc = Date('B',Right(stat._dst.created,5),'J');
+Return (_based - _calc);
+
+/* ----------------------------------------------------------------- */
+/* Perform binary search of volume stem array.                       */
+/* ----------------------------------------------------------------- */
+FindVolumeInfo: Procedure Expose _pgm vols. _last_vol_found;
+  Arg _vol;
+  If _vol <> Word(vols._last_vol_found,1) Then Do
+    m = IFF(DataType(_last_vol_found,"W"),_last_vol_found,0);
+    If vols.0 > 0 Then Do
+      f = 1; l = vols.0; m = Trunc((l-f+1)/2) + f;
+      Do c = 1 While _vol <> Word(vols.m,1)
+        If _vol < Word(vols.m,1) Then Do
+          If m == f Then Leave;
+          l = m - 1;
+        End
+        Else Do
+          If m == l Then Leave;
+          f = m + 1;
+        End
+        m = Trunc((l-f+1)/2) + f;
+      End
+    End
+    If _vol <> Word(vols.m,1) Then Do
+      Say _pgm': No SPCMAP info for volume' _vol;
+      Exit 16;
+    End
+    _last_vol_found = m;
+  End
+Return vols._last_vol_found;
+/* ----------------------------------------------------------------- */
+
+GetDeletePct:
+  _calc = 0;
+  If stat._dta.deletes > 0 Then Do
+    _calc = stat._dta.deletes + stat._dta.records;
+    _calc = (stat._dta.deletes / _calc) * 100;
+  End
+Return _calc;
+
+GetFullPct:
+  _calc = 0;
+  If stat._dta.hialcrba > 0 Then Do
+    If stat._dta.secondary > 0 Then
+      _calc = stat._dta.hialcrba;
+    Else Do
+      _calc = stat._dta.hialcrba / stat._dta.extents,
+                                 * Words(stat._dta.volumes);
+    End
+    _calc = (stat._dta.hiuserba / _calc) * 100;
+  End
+Return _calc;
+
+GetSplitPct:
+  _calc = 0;
+  If stat._dta.casplits > 0 Then Do
+    If stat._dta.extents == 1,
+    |  stat._dta.secondary == 0,
+    Then
+      _calc = stat._dta.primary * stat._dta.extents;
+    Else Do
+      If Words(stat._dta.volumes) <= stat._dta.extents Then
+        _calc = (stat._dta.secondary,
+              * (stat._dta.extents - Words(stat._dta.volumes))),
+              + (stat._dta.primary * Words(stat._dta.volumes));
+      Else Do
+        _calc = Trunc(stat._dta.extents / 2);
+        _calc = (stat._dta.secondary * (stat._dta.extents - _calc)),
+              + (stat._dta.primary * _calc));
+      End
+    End
+    _calc = (stat._dta.casplits / _calc) * 100;
+  End
+Return _calc;
+
+/* ----------------------------------------------------------------- */
+/* Submit a reorg job                                                */
+/* ----------------------------------------------------------------- */
+
+SubmitReorg: Procedure Expose _pgm _True _False rc,
+                              rjcl. xjcl. dinfo. clist.;
+  Arg mode,type,dsn,cat;
+  n = LocateReorgParms(dsn);
+  If rc == 0 Then Do
+    DSP = IFF(mode=='IMMED', 'K', 'L'); /* set job disposition */
+    Parse Var dinfo.n dsn defproc aixproc .;
+    Parse Var clist.defproc clst;
+    jcl.  = '';
+    jcl.0 = 0;
+    If type == 'XLDS' Then Do
+      Do r = 1 to xjcl.0
+        Call AddJCL xjcl.r;
+      End
+    End
+    Else Do
+      Do r = 1 to rjcl.0
+        Call AddJCL rjcl.r;
+      End
+    End
+    z = OUTTRAP('err.','*','NOCONCAT');
+    Address POWER "PUTQE RDR STEM jcl. NOGENCM";
+    If rc <> 0 Then Do
+      Say _pgm': Error submitting POWER RDR queue entry; rc =' rc;
+      Do r = 1 to err.0
+        Say err.r;
+      End
+      rc = 16;
+      Return;
+    End
+  End
+Return;
+
+AddJCL:
+  Select
+    When InStr('*AIXOMIT*',Arg(1)) & aixproc == '' Then
+      Do
+        Nop;
+      End
+    When InStr('*BSTCNTL*',Arg(1)) Then
+      Do
+        If \InList('*BSTCNTL*',clst) Then
+          Nop;
+        Else Do
+          n = jcl.0 + 1;
+          jcl.n = Arg(1);
+          jcl.n = ReplStr('*BSTCNTL*',jcl.n,'');
+          jcl.0 = n;
+        End
+      End
+    When InStr('*IESCNTL*',Arg(1)) Then
+      Do
+        If \InList('*IESCNTL*',clst) Then
+          Nop;
+        Else Do
+          n = jcl.0 + 1;
+          jcl.n = Arg(1);
+          jcl.n = ReplStr('*IESCNTL*',jcl.n,'');
+          jcl.0 = n;
+        End
+      End
+    When InStr('<CLOSE>',Arg(1)) Then
+      Do s = 1 to Words(clst)
+        If Word(clst,s) <> '*BSTCNTL*',
+        &  Word(clst,s) <> '*IESCNTL*',
+        Then Do
+          n = jcl.0 + 1;
+          jcl.n = Arg(1);
+          jcl.0 = n;
+          close = Word(clst,s);
+          Call ReplaceSymbolics;
+        End
+      End
+    Otherwise
+      Do
+        n = jcl.0 + 1;
+        jcl.n = Arg(1);
+        jcl.n = ReplStr('*AIXOMIT*',jcl.n,'');
+        jcl.0 = n;
+        Call ReplaceSymbolics;
+      End
+  End
+Return;
+
+/* ----------------------------------------------------------------- */
+/* Perform binary search of reorg parms stem array                   */
+/* ----------------------------------------------------------------- */
+LocateReorgParms: Procedure Expose _pgm rc dinfo.;
+  Arg _dsn,_opt;
+  If dinfo.0 > 0 Then Do
+    f = 1; l = dinfo.0; m = Trunc((l-f+1)/2) + f;
+    Do c = 1 While _dsn <> Word(dinfo.m,1)
+      If _dsn < Word(dinfo.m,1) Then Do
+        If m == f Then Leave;
+        l = m - 1;
+      End
+      Else Do
+        If m == l Then Leave;
+        f = m + 1;
+      End
+      m = Trunc((l-f+1)/2) + f;
+    End
+  End
+  If _dsn <> Word(dinfo.m,1) Then Do
+    If Left(_opt,1) <> 'S' Then Do
+      Say _pgm': No reorg parms for dsn =' _dsn;
+      rc = 23;
+    End
+    Return 0;
+  End
+Return m;
+/* ----------------------------------------------------------------- */
+
+ReplaceSymbolics:
+  Do While Pos('<',jcl.n) > 0
+    Parse Var jcl.n '<'_temp'>';
+    jcl.n = ReplStr('<'_temp'>',jcl.n,Value(_temp),_true,'I');
+  End
+Return;
+
+/INCLUDE COPYBOOKS.XDITTO
+/INCLUDE COPYBOOKS.XFUNCTNS
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

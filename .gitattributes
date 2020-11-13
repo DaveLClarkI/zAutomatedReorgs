@@ -1,2 +1,4 @@
-*.jcl linguist-language=Job-Control-Language
 *.proc linguist-language=REXX
+*.jcl linguist-language=JCL
+*.j linguist-language=DATA
+*.z linguist-language=DATA

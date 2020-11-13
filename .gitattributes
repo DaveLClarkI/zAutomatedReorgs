@@ -1,4 +1,4 @@
-*.proc linguist-language=REXX
-*.jcl linguist-language=JCL
-*.j linguist-language=DATA
-*.z linguist-language=DATA
+*.PROC linguist-language=REXX
+*.JCL linguist-language=JCL
+*.J linguist-language=DATA
+*.Z linguist-language=DATA

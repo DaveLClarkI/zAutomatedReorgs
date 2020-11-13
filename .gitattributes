@@ -1,0 +1,2 @@
+*.jcl linguist-language=Job-Control-Language
+*.proc linguist-language=REXX

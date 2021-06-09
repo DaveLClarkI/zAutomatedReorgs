@@ -1,6 +1,6 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /* REXX: ANLREORG   Proc Created 12/15/2010   By Dave Clark        */
-/*                  Last Revised 06/27/2019                        */
+/*                  Last Revised 05/19/2021                        */
 /*                                                                 */
 /* This procedure analyzes the content of the specified catalog(s) */
 /* for files which are  eligible for reorganization.   Any file so */
@@ -1368,7 +1368,9 @@ Return vols._last_vol_found;
 
 GetDeletePct:
   _calc = 0;
-  If stat._dta.deletes > 0 Then Do
+  If stat._dta.deletes > 0,
+  &  stat._dta.records > 0,
+  Then Do
     _calc = stat._dta.deletes + stat._dta.records;
     _calc = (stat._dta.deletes / _calc) * 100;
   End
